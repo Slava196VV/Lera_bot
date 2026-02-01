@@ -2,156 +2,187 @@ import os
 import logging
 import requests
 import base64
+import asyncio
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from PIL import Image
 import io
 
+# Настройка логирования
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
+# Получаем переменные окружения
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
+HF_TOKEN = os.getenv('HF_TOKEN')
 
-# ИСПОЛЬЗУЕМ ДОСТУПНУЮ МОДЕЛЬ ИЗ ВАШЕГО СПИСКА
-GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1/models/gemini-2.0-flash-001:generateContent?key={GEMINI_API_KEY}"
-
-if not TELEGRAM_TOKEN or not GEMINI_API_KEY:
-    logger.error("❌ Не установлены переменные окружения")
+# Проверка обязательных переменных
+if not TELEGRAM_TOKEN:
+    logger.error("❌ Переменная TELEGRAM_BOT_TOKEN не установлена!")
+    exit(1)
+if not HF_TOKEN:
+    logger.error("❌ Переменная HF_TOKEN не установлена!")
     exit(1)
 
+# Конфигурация Hugging Face
+API_URL = "https://api-inference.huggingface.co/models/Qwen/Qwen2-VL-7B-Instruct"
+HEADERS = {"Authorization": f"Bearer {HF_TOKEN}"}
+
+# Системный промпт
 SYSTEM_PROMPT = """Ты опытный школьный репетитор для учеников 11 класса. 
 Реши задачу по шагам с подробными объяснениями. Выдели финальный ответ словом "Ответ:".
-Пиши на русском языке. Если на фото нет задачи — ответь "ОШИБКА"."""
+Пиши на русском языке. Если на фото нет учебной задачи — ответь только "ОШИБКА"."""
 
+# Хранилище контекста (для уточняющих вопросов)
 user_contexts = {}
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("📸 Отправь фото задачи — решу по шагам!")
+    await update.message.reply_text(
+        "📸 Привет! Я — бесплатный бот-репетитор для 11 класса.\n\n"
+        "Отправь мне фото задачи, и я:\n"
+        "✅ Решу её по шагам\n"
+        "✅ Объясню каждое действие\n"
+        "✅ Выделю финальный ответ\n\n"
+        "Жду твоё фото! 📱"
+    )
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    await update.message.reply_text("⏳ Анализирую задачу... (8-15 сек)")
-    
+    msg = await update.message.reply_text("⏳ Анализирую задачу... (30–60 секунд)")
+
     try:
-        # Получаем фото
+        # Получаем фото в максимальном разрешении
         photo_file = await update.message.photo[-1].get_file()
         photo_bytes = await photo_file.download_as_bytearray()
+
+        # Конвертируем в base64
         base64_image = base64.b64encode(photo_bytes).decode('utf-8')
-        
-        # Формируем запрос к gemini-2.0-flash-001
+
+        # Формируем запрос
         payload = {
-            "contents": [{
-                "parts": [
-                    {"text": SYSTEM_PROMPT},
-                    {
-                        "inline_data": {
-                            "mime_type": "image/jpeg",
-                            "data": base64_image
-                        }
-                    }
-                ]
-            }],
-            "generation_config": {
-                "max_output_tokens": 2048,
-                "temperature": 0.2
+            "inputs": {
+                "image": base64_image,
+                "text": SYSTEM_PROMPT + "\n\nРеши задачу на изображении."
             },
-            "safety_settings": [
-                {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-                {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-                {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-                {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"}
-            ]
+            "parameters": {
+                "max_new_tokens": 2048,
+                "temperature": 0.3
+            }
         }
-        
-        # Отправляем запрос
-        response = requests.post(GEMINI_API_URL, json=payload, timeout=30)
-        
-        if response.status_code != 200:
-            error_detail = response.json().get('error', {}).get('message', 'Unknown error')
-            logger.error(f"Gemini API error {response.status_code}: {error_detail}")
-            await update.message.reply_text("❌ Ошибка ИИ. Попробуйте позже.")
+
+        # Отправляем запрос с повторными попытками (важно для Railway)
+        for attempt in range(3):
+            try:
+                response = requests.post(
+                    API_URL,
+                    headers=HEADERS,
+                    json=payload,
+                    timeout=60  # Railway может убить процесс дольше 55 сек
+                )
+                if response.status_code == 200:
+                    break
+                elif response.status_code == 503 and "estimated_time" in response.text:
+                    # Модель загружается — ждём
+                    await msg.edit_text("🔄 Модель запускается... Подождите ещё 30 секунд")
+                    await asyncio.sleep(30)
+                    continue
+                else:
+                    raise Exception(f"HTTP {response.status_code}: {response.text[:200]}")
+            except requests.Timeout:
+                if attempt == 2:
+                    raise
+                await asyncio.sleep(10)
+
+        # Обработка ответа
+        result = response.json()
+        if isinstance(result, list) and len(result) > 0:
+            solution = result[0].get('generated_text', '').strip()
+        else:
+            solution = ""
+
+        if not solution or "ОШИБКА" in solution.upper()[:50]:
+            await msg.edit_text("❌ На фото не обнаружена учебная задача.\nПопробуйте чёткое фото из учебника.")
             return
-        
-        data = response.json()
-        solution = data['candidates'][0]['content']['parts'][0]['text'].strip()
-        
-        if "ОШИБКА" in solution.upper()[:50]:
-            await update.message.reply_text("❌ На фото не обнаружена учебная задача.")
-            return
-        
+
+        # Сохраняем контекст
         user_contexts[user_id] = {'image_bytes': photo_bytes, 'solution': solution}
-        
+
+        # Удаляем статусное сообщение
+        await msg.delete()
+
         # Отправляем решение
         if len(solution) > 4000:
-            for i in range(0, len(solution), 4000):
-                await update.message.reply_text(solution[i:i+4000])
+            parts = [solution[i:i+4000] for i in range(0, len(solution), 4000)]
+            for i, part in enumerate(parts, 1):
+                await update.message.reply_text(f"Часть {i}/{len(parts)}:\n\n{part}")
         else:
             await update.message.reply_text(solution)
-            
-        await update.message.reply_text("❓ Есть вопросы? Напиши их текстом!")
-        
+
+        await update.message.reply_text("❓ Есть вопросы по решению? Напиши их текстом!")
+
     except Exception as e:
-        logger.error(f"Ошибка фото: {e}", exc_info=True)
-        await update.message.reply_text("❌ Ошибка обработки. Попробуйте другое фото.")
+        logger.error(f"Ошибка при обработке фото: {e}", exc_info=True)
+        await msg.edit_text(
+            "❌ Не удалось решить задачу.\n"
+            "Возможные причины:\n"
+            "• Фото слишком размытое\n"
+            "• Задача написана от руки неразборчиво\n"
+            "• Сервер Hugging Face перегружен\n\n"
+            "Попробуйте отправить фото ещё раз через 1–2 минуты."
+        )
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id not in user_contexts:
         await update.message.reply_text("📸 Сначала отправь фото задачи!")
         return
-    
-    await update.message.reply_text("⏳ Обрабатываю вопрос...")
-    
+
+    msg = await update.message.reply_text("⏳ Думаю над твоим вопросом...")
+
     try:
         context_data = user_contexts[user_id]
         base64_image = base64.b64encode(context_data['image_bytes']).decode('utf-8')
-        
-        followup_prompt = f"""Ты репетитор. Вот решение задачи:
+
+        followup_prompt = f"""Ты репетитор. Вот предыдущее решение:
 
 {context_data['solution']}
 
 Ученик спрашивает: {update.message.text}
 
-Ответь кратко на русском языке."""
-        
+Ответь кратко и по делу на русском языке."""
+
         payload = {
-            "contents": [{
-                "parts": [
-                    {"text": followup_prompt},
-                    {
-                        "inline_data": {
-                            "mime_type": "image/jpeg",
-                            "data": base64_image
-                        }
-                    }
-                ]
-            }],
-            "generation_config": {"max_output_tokens": 1024}
+            "inputs": {
+                "image": base64_image,
+                "text": followup_prompt
+            },
+            "parameters": {"max_new_tokens": 1024}
         }
-        
-        response = requests.post(GEMINI_API_URL, json=payload, timeout=20)
-        if response.status_code != 200:
-            raise Exception(f"API error {response.status_code}")
-        
-        data = response.json()
-        answer = data['candidates'][0]['content']['parts'][0]['text'].strip()
-        await update.message.reply_text(answer)
-        
+
+        response = requests.post(API_URL, headers=HEADERS, json=payload, timeout=40)
+        result = response.json()
+        answer = result[0].get('generated_text', '').strip() if isinstance(result, list) else ""
+
+        await msg.delete()
+        if answer:
+            await update.message.reply_text(answer)
+        else:
+            await update.message.reply_text("❌ Не понял вопрос. Попробуй сформулировать иначе.")
+
     except Exception as e:
-        logger.error(f"Ошибка текста: {e}", exc_info=True)
-        await update.message.reply_text("❌ Ошибка ответа. Попробуйте переформулировать.")
+        logger.error(f"Ошибка при обработке текста: {e}", exc_info=True)
+        await msg.edit_text("❌ Ошибка при ответе. Попробуй переформулировать вопрос.")
 
 def main():
     application = Application.builder().token(TELEGRAM_TOKEN).build()
     application.add_handler(CommandHandler("start", start))
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    
-    logger.info("🚀 Бот запущен! Модель: gemini-2.0-flash-001")
+
+    logger.info("🚀 Бот запущен! Модель: Qwen2-VL-7B (Hugging Face)")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
