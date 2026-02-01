@@ -25,15 +25,17 @@ if not GEMINI_API_KEY or not GEMINI_API_KEY.startswith("AIzaSy"):
     logger.error("❌ Не установлена или неверная переменная окружения GEMINI_API_KEY")
     exit(1)
 
-# Инициализация Gemini (ИСПОЛЬЗУЕМ gemini-pro-vision для версии 0.7.2)
+# Инициализация Gemini (ИСПОЛЬЗУЕМ РАБОЧУЮ МОДЕЛЬ ДЛЯ v1beta)
 try:
     genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel('gemini-pro-vision')  # ← КРИТИЧЕСКОЕ ИЗМЕНЕНИЕ
+    # КРИТИЧЕСКОЕ ИЗМЕНЕНИЕ: используем правильное имя модели для v1beta
+    model = genai.GenerativeModel('gemini-1.0-pro-vision-latest')
+    
     # Тестовый запрос
     test_resp = model.generate_content("Тест")
     if not test_resp.candidates or not test_resp.candidates[0].content.parts:
         raise Exception("Пустой ответ от API")
-    logger.info("✅ Gemini API подключён успешно (модель: gemini-pro-vision)")
+    logger.info("✅ Gemini API подключён успешно (модель: gemini-1.0-pro-vision-latest)")
 except Exception as e:
     logger.error(f"❌ Ошибка подключения к Gemini: {e}")
     exit(1)
@@ -142,7 +144,7 @@ def main():
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     
-    logger.info("🚀 Бот запущен! Версии: PTB=21.0.1, Gemini=0.7.2 (модель: gemini-pro-vision)")
+    logger.info("🚀 Бот запущен! Версии: PTB=21.0.1, Gemini=0.7.2 (модель: gemini-1.0-pro-vision-latest)")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
