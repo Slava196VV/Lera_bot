@@ -1,8 +1,9 @@
 import os
 import logging
+import requests
+import base64
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-import google.generativeai as genai
 from PIL import Image
 import io
 
@@ -13,50 +14,22 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Конфигурация API ключей из переменных окружения
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
+GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
 
-# Проверка ключей
-if not TELEGRAM_TOKEN:
-    logger.error("❌ Не установлена переменная окружения TELEGRAM_BOT_TOKEN")
-    exit(1)
-if not GEMINI_API_KEY or not GEMINI_API_KEY.startswith("AIzaSy"):
-    logger.error("❌ Не установлена или неверная переменная окружения GEMINI_API_KEY")
-    exit(1)
-
-# Инициализация Gemini (теперь работает с v1 API)
-try:
-    genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel('gemini-1.5-flash')  # ✅ Работает в версии ≥0.8.0
-    
-    # Тестовый запрос (новый синтаксис для версии ≥0.8.0)
-    test_resp = model.generate_content("Привет")
-    logger.info("✅ Gemini API подключён успешно (модель: gemini-1.5-flash)")
-except Exception as e:
-    logger.error(f"❌ Ошибка подключения к Gemini: {e}")
-    logger.error("Проверьте: 1) Версия google-generativeai ≥0.8.3  2) API включён в Google Cloud")
+if not TELEGRAM_TOKEN or not GEMINI_API_KEY:
+    logger.error("❌ Не установлены переменные окружения")
     exit(1)
 
 SYSTEM_PROMPT = """Ты опытный школьный репетитор для учеников 11 класса. 
-Твоя задача - помогать решать задачи по всем школьным предметам.
-
-ВАЖНО:
-1. Давай ПОЛНОЕ пошаговое решение
-2. Пиши простым текстом без форматирования
-3. Нумеруй шаги (Шаг 1, Шаг 2...)
-4. В конце выдели финальный ответ словом "Ответ:"
-5. Пиши на русском языке
-
-Если на изображении НЕТ учебной задачи - ответь только "ОШИБКА"."""
+Реши задачу по шагам, объясни каждое действие, выдели финальный ответ словом "Ответ:".
+Пиши на русском языке. Если на фото нет задачи — ответь "ОШИБКА"."""
 
 user_contexts = {}
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "📸 Отправь фото задачи — решу по шагам!\n"
-        "Поддерживаю все предметы 11 класса."
-    )
+    await update.message.reply_text("📸 Отправь фото задачи — решу по шагам!")
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -65,32 +38,55 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         photo_file = await update.message.photo[-1].get_file()
         photo_bytes = await photo_file.download_as_bytearray()
-        image = Image.open(io.BytesIO(photo_bytes))
         
-        # Новый синтаксис для версии ≥0.8.0 (работает с .text)
-        response = model.generate_content(
-            [SYSTEM_PROMPT, image],
-            generation_config={"max_output_tokens": 2048},
-            safety_settings={
-                "HARASSMENT": "BLOCK_NONE",
-                "HATE": "BLOCK_NONE",
-                "SEXUAL": "BLOCK_NONE",
-                "DANGEROUS": "BLOCK_NONE"
-            }
-        )
+        # Конвертация в base64
+        base64_image = base64.b64encode(photo_bytes).decode('utf-8')
         
-        # Автоматическая обработка блокировок безопасности
-        if hasattr(response, 'prompt_feedback') and response.prompt_feedback.block_reason:
-            await update.message.reply_text("❌ Запрос заблокирован системой безопасности. Отправьте другое фото.")
+        # Формирование запроса к v1 API
+        payload = {
+            "contents": [{
+                "parts": [
+                    {"text": SYSTEM_PROMPT},
+                    {
+                        "inline_data": {
+                            "mime_type": "image/jpeg",
+                            "data": base64_image
+                        }
+                    }
+                ]
+            }],
+            "generation_config": {
+                "max_output_tokens": 2048,
+                "temperature": 0.2
+            },
+            "safety_settings": [
+                {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"}
+            ]
+        }
+        
+        # Прямой запрос к API v1
+        response = requests.post(GEMINI_API_URL, json=payload, timeout=30)
+        
+        if response.status_code != 200:
+            logger.error(f"Gemini API error {response.status_code}: {response.text}")
+            await update.message.reply_text("❌ Ошибка ИИ. Попробуйте позже.")
             return
         
-        solution = response.text.strip()
+        data = response.json()
+        if 'candidates' not in data or not data['candidates']:
+            await update.message.reply_text("❌ Не удалось распознать задачу.")
+            return
+        
+        solution = data['candidates'][0]['content']['parts'][0]['text'].strip()
         
         if "ОШИБКА" in solution.upper()[:50]:
             await update.message.reply_text("❌ На фото не обнаружена учебная задача.")
             return
         
-        user_contexts[user_id] = {'image': image, 'solution': solution}
+        user_contexts[user_id] = {'image_bytes': photo_bytes, 'solution': solution}
         
         if len(solution) > 4000:
             for i in range(0, len(solution), 4000):
@@ -114,24 +110,37 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     try:
         context_data = user_contexts[user_id]
-        followup_prompt = f"""Ты репетитор. Вот предыдущее решение:
+        base64_image = base64.b64encode(context_data['image_bytes']).decode('utf-8')
+        
+        followup_prompt = f"""Ты репетитор. Вот решение задачи:
 
 {context_data['solution']}
 
 Ученик спрашивает: {update.message.text}
 
-Ответь кратко и по делу на русском языке."""
+Ответь кратко на русском языке."""
         
-        response = model.generate_content(
-            [followup_prompt, context_data['image']],
-            generation_config={"max_output_tokens": 1024}
-        )
+        payload = {
+            "contents": [{
+                "parts": [
+                    {"text": followup_prompt},
+                    {
+                        "inline_data": {
+                            "mime_type": "image/jpeg",
+                            "data": base64_image
+                        }
+                    }
+                ]
+            }],
+            "generation_config": {"max_output_tokens": 1024}
+        }
         
-        if hasattr(response, 'prompt_feedback') and response.prompt_feedback.block_reason:
-            await update.message.reply_text("❌ Вопрос заблокирован. Попробуйте сформулировать иначе.")
-            return
-            
-        answer = response.text.strip()
+        response = requests.post(GEMINI_API_URL, json=payload, timeout=20)
+        if response.status_code != 200:
+            raise Exception(f"API error {response.status_code}")
+        
+        data = response.json()
+        answer = data['candidates'][0]['content']['parts'][0]['text'].strip()
         await update.message.reply_text(answer)
         
     except Exception as e:
@@ -144,7 +153,7 @@ def main():
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     
-    logger.info("🚀 Бот запущен! Версии: PTB=21.0.1, Gemini≥0.8.3 (модель: gemini-1.5-flash)")
+    logger.info("🚀 Бот запущен! Используется прямой запрос к Gemini v1 API")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
