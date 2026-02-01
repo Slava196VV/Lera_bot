@@ -5,10 +5,6 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 import google.generativeai as genai
 from PIL import Image
 import io
-from dotenv import load_dotenv
-
-# Загрузка переменных окружения
-load_dotenv()
 
 # Настройка логирования
 logging.basicConfig(
@@ -17,29 +13,29 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Конфигурация API ключей
+# Конфигурация API ключей из переменных окружения
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
 
 # Проверка ключей
 if not TELEGRAM_TOKEN:
-    logger.error("❌ Не установлен TELEGRAM_BOT_TOKEN в .env")
+    logger.error("❌ Не установлена переменная окружения TELEGRAM_BOT_TOKEN")
     exit(1)
 if not GEMINI_API_KEY or not GEMINI_API_KEY.startswith("AIzaSy"):
-    logger.error("❌ Неверный GEMINI_API_KEY в .env")
+    logger.error("❌ Не установлена или неверная переменная окружения GEMINI_API_KEY")
     exit(1)
 
 # Инициализация Gemini
 try:
     genai.configure(api_key=GEMINI_API_KEY)
     model = genai.GenerativeModel('gemini-1.5-flash')
-    # Тестовый запрос (для версии 0.7.2 используем правильный синтаксис)
+    # Тестовый запрос для версии 0.7.2
     test_resp = model.generate_content("Тест")
     if not test_resp.candidates or not test_resp.candidates[0].content.parts:
         raise Exception("Пустой ответ от API")
-    logger.info("✅ Gemini API подключён (версия google-generativeai: 0.7.2)")
+    logger.info("✅ Gemini API подключён успешно")
 except Exception as e:
-    logger.error(f"❌ Ошибка Gemini: {e}")
+    logger.error(f"❌ Ошибка подключения к Gemini: {e}")
     exit(1)
 
 SYSTEM_PROMPT = """Ты опытный школьный репетитор для учеников 11 класса. 
@@ -67,12 +63,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⏳ Анализирую задачу... (10-20 сек)")
     
     try:
-        # Получаем фото
         photo_file = await update.message.photo[-1].get_file()
         photo_bytes = await photo_file.download_as_bytearray()
         image = Image.open(io.BytesIO(photo_bytes))
         
-        # Запрос к Gemini (для версии 0.7.2)
         response = model.generate_content(
             [SYSTEM_PROMPT, image],
             generation_config=genai.types.GenerationConfig(max_output_tokens=2048),
@@ -84,22 +78,18 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             }
         )
         
-        # === КРИТИЧЕСКИ ВАЖНО ДЛЯ ВЕРСИИ 0.7.2 ===
         if not response.candidates or not response.candidates[0].content.parts:
             await update.message.reply_text("❌ Не удалось распознать задачу. Отправьте чёткое фото.")
             return
         
         solution = response.candidates[0].content.parts[0].text.strip()
         
-        # Проверка на ошибку
         if "ОШИБКА" in solution.upper()[:50]:
             await update.message.reply_text("❌ На фото не обнаружена учебная задача.")
             return
         
-        # Сохраняем контекст
         user_contexts[user_id] = {'image': image, 'solution': solution}
         
-        # Отправка ответа
         if len(solution) > 4000:
             for i in range(0, len(solution), 4000):
                 await update.message.reply_text(solution[i:i+4000])
