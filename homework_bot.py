@@ -8,12 +8,14 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 from PIL import Image
 import io
 
+# Настройка логирования
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
+# Переменные окружения
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 HF_TOKEN = os.getenv('HF_TOKEN')
 
@@ -24,14 +26,14 @@ if not HF_TOKEN:
     logger.error("❌ HF_TOKEN не установлен!")
     exit(1)
 
-# ПРАВИЛЬНЫЙ ЭНДПОИНТ + ЗАГОЛОВОК ДЛЯ НОВОГО РОУТЕРА
-API_URL = "https://api-inference.huggingface.co/models/Qwen/Qwen2-VL-7B-Instruct"
+# ОФИЦИАЛЬНЫЙ ЭНДПОИНТ HUGGING FACE (февраль 2026)
+HF_API_URL = "https://api.huggingface.co/v1/tasks/image-to-text"
 HEADERS = {
     "Authorization": f"Bearer {HF_TOKEN}",
-    "Content-Type": "application/json",
-    "X-HF-Router": "v2"  # 🔑 КРИТИЧЕСКИ ВАЖНЫЙ ЗАГОЛОВОК ДЛЯ 2026 ГОДА
+    "Content-Type": "application/json"
 }
 
+# Системный промпт
 SYSTEM_PROMPT = """Ты опытный школьный репетитор для учеников 11 класса. 
 Реши задачу по шагам с подробными объяснениями. Выдели финальный ответ словом "Ответ:".
 Пиши на русском языке. Если на фото нет учебной задачи — ответь только "ОШИБКА"."""
@@ -41,7 +43,10 @@ user_contexts = {}
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📸 Привет! Я — бесплатный бот-репетитор для 11 класса.\n\n"
-        "Отправь мне фото задачи, и я решу её по шагам!\n"
+        "Отправь мне фото задачи, и я:\n"
+        "✅ Решу её по шагам\n"
+        "✅ Объясню каждое действие\n"
+        "✅ Выделю финальный ответ\n\n"
         "Жду твоё фото! 📱"
     )
 
@@ -50,11 +55,14 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text("⏳ Анализирую задачу... (30–60 секунд)")
 
     try:
+        # Получаем фото
         photo_file = await update.message.photo[-1].get_file()
         photo_bytes = await photo_file.download_as_bytearray()
         base64_image = base64.b64encode(photo_bytes).decode('utf-8')
 
+        # Формируем запрос к официальному API
         payload = {
+            "model": "Qwen/Qwen2-VL-7B-Instruct",
             "inputs": {
                 "image": base64_image,
                 "text": SYSTEM_PROMPT + "\n\nРеши задачу на изображении."
@@ -65,34 +73,35 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             }
         }
 
+        # Отправляем запрос с повторными попытками
         for attempt in range(3):
             try:
                 response = requests.post(
-                    API_URL,
+                    HF_API_URL,
                     headers=HEADERS,
                     json=payload,
                     timeout=60
                 )
                 
-                # Отладка: если ответ не JSON — логируем тело
-                try:
-                    result = response.json()
-                except Exception:
-                    logger.warning(f"Не-JSON ответ ({response.status_code}): {response.text[:200]}")
-                    if attempt < 2:
-                        await asyncio.sleep(15)
-                        continue
-                    raise Exception(f"Сервер вернул не-JSON: {response.status_code}")
-                
                 if response.status_code == 200:
                     break
-                elif response.status_code == 503 and "estimated_time" in str(result):
-                    wait_time = result.get("estimated_time", 30)
-                    await msg.edit_text(f"🔄 Модель запускается... Подождите ~{int(wait_time)} секунд")
+                elif response.status_code == 503 and "estimated_time" in response.text:
+                    # Модель загружается
+                    wait_time = 30
+                    try:
+                        error_data = response.json()
+                        wait_time = int(error_data.get("estimated_time", 30))
+                    except:
+                        pass
+                    await msg.edit_text(f"🔄 Модель запускается... Подождите ~{wait_time} секунд")
                     await asyncio.sleep(max(10, wait_time))
                     continue
                 else:
-                    error_detail = result.get("error", "Unknown error")
+                    # Пытаемся получить ошибку из JSON
+                    try:
+                        error_detail = response.json().get("error", "Unknown error")
+                    except:
+                        error_detail = response.text[:200]
                     raise Exception(f"HTTP {response.status_code}: {error_detail}")
                     
             except requests.Timeout:
@@ -100,7 +109,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     raise
                 await asyncio.sleep(10)
 
-        solution = result[0].get('generated_text', '').strip() if isinstance(result, list) else result.get('generated_text', '').strip()
+        # Обработка ответа
+        result = response.json()
+        solution = result.get("generated_text", "").strip()
 
         if not solution or "ОШИБКА" in solution.upper()[:50]:
             await msg.edit_text("❌ На фото не обнаружена учебная задача.\nПопробуйте чёткое фото из учебника.")
@@ -109,18 +120,23 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_contexts[user_id] = {'image_bytes': photo_bytes, 'solution': solution}
         await msg.delete()
 
+        # Отправка решения
         if len(solution) > 4000:
-            for i in range(0, len(solution), 4000):
-                await update.message.reply_text(solution[i:i+4000])
+            parts = [solution[i:i+4000] for i in range(0, len(solution), 4000)]
+            for i, part in enumerate(parts, 1):
+                await update.message.reply_text(f"Часть {i}/{len(parts)}:\n\n{part}")
         else:
             await update.message.reply_text(solution)
 
-        await update.message.reply_text("❓ Есть вопросы? Напиши их текстом!")
+        await update.message.reply_text("❓ Есть вопросы по решению? Напиши их текстом!")
 
     except Exception as e:
         logger.error(f"Ошибка при обработке фото: {e}", exc_info=True)
         await msg.edit_text(
             "❌ Не удалось решить задачу.\n"
+            "Возможные причины:\n"
+            "• Фото слишком размытое\n"
+            "• Сервер Hugging Face перегружен\n\n"
             "Попробуйте отправить фото ещё раз через 1–2 минуты."
         )
 
@@ -136,15 +152,16 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context_data = user_contexts[user_id]
         base64_image = base64.b64encode(context_data['image_bytes']).decode('utf-8')
 
-        followup_prompt = f"""Ты репетитор. Вот решение:
+        followup_prompt = f"""Ты репетитор. Вот предыдущее решение:
 
 {context_data['solution']}
 
-Вопрос: {update.message.text}
+Ученик спрашивает: {update.message.text}
 
-Ответь кратко на русском."""
+Ответь кратко и по делу на русском языке."""
 
         payload = {
+            "model": "Qwen/Qwen2-VL-7B-Instruct",
             "inputs": {
                 "image": base64_image,
                 "text": followup_prompt
@@ -152,16 +169,27 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "parameters": {"max_new_tokens": 1024}
         }
 
-        response = requests.post(API_URL, headers=HEADERS, json=payload, timeout=40)
+        response = requests.post(HF_API_URL, headers=HEADERS, json=payload, timeout=40)
+        
+        if response.status_code != 200:
+            try:
+                error_detail = response.json().get("error", "Unknown error")
+            except:
+                error_detail = response.text[:200]
+            raise Exception(f"HTTP {response.status_code}: {error_detail}")
+            
         result = response.json()
-        answer = result[0].get('generated_text', '').strip() if isinstance(result, list) else result.get('generated_text', '').strip()
+        answer = result.get("generated_text", "").strip()
 
         await msg.delete()
-        await update.message.reply_text(answer if answer else "❌ Не понял вопрос. Попробуй иначе.")
+        if answer:
+            await update.message.reply_text(answer)
+        else:
+            await update.message.reply_text("❌ Не понял вопрос. Попробуй сформулировать иначе.")
 
     except Exception as e:
-        logger.error(f"Ошибка текста: {e}", exc_info=True)
-        await msg.edit_text("❌ Ошибка ответа. Попробуй переформулировать.")
+        logger.error(f"Ошибка при обработке текста: {e}", exc_info=True)
+        await msg.edit_text("❌ Ошибка при ответе. Попробуй переформулировать вопрос.")
 
 def main():
     application = Application.builder().token(TELEGRAM_TOKEN).build()
@@ -169,8 +197,8 @@ def main():
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    logger.info("🚀 Бот запущен! Модель: Qwen2-VL-7B (HF Router v2)")
-    application.run_polling()
+    logger.info("🚀 Бот запущен! Модель: Qwen2-VL-7B (Hugging Face Official API)")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
     main()
