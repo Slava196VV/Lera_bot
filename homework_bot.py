@@ -25,19 +25,17 @@ if not GEMINI_API_KEY or not GEMINI_API_KEY.startswith("AIzaSy"):
     logger.error("❌ Не установлена или неверная переменная окружения GEMINI_API_KEY")
     exit(1)
 
-# Инициализация Gemini (ИСПОЛЬЗУЕМ РАБОЧУЮ МОДЕЛЬ ДЛЯ v1beta)
+# Инициализация Gemini (теперь работает с v1 API)
 try:
     genai.configure(api_key=GEMINI_API_KEY)
-    # КРИТИЧЕСКОЕ ИЗМЕНЕНИЕ: используем правильное имя модели для v1beta
-    model = genai.GenerativeModel('gemini-1.0-pro-vision-latest')
+    model = genai.GenerativeModel('gemini-1.5-flash')  # ✅ Работает в версии ≥0.8.0
     
-    # Тестовый запрос
-    test_resp = model.generate_content("Тест")
-    if not test_resp.candidates or not test_resp.candidates[0].content.parts:
-        raise Exception("Пустой ответ от API")
-    logger.info("✅ Gemini API подключён успешно (модель: gemini-1.0-pro-vision-latest)")
+    # Тестовый запрос (новый синтаксис для версии ≥0.8.0)
+    test_resp = model.generate_content("Привет")
+    logger.info("✅ Gemini API подключён успешно (модель: gemini-1.5-flash)")
 except Exception as e:
     logger.error(f"❌ Ошибка подключения к Gemini: {e}")
+    logger.error("Проверьте: 1) Версия google-generativeai ≥0.8.3  2) API включён в Google Cloud")
     exit(1)
 
 SYSTEM_PROMPT = """Ты опытный школьный репетитор для учеников 11 класса. 
@@ -62,16 +60,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    await update.message.reply_text("⏳ Анализирую задачу... (15-25 сек)")
+    await update.message.reply_text("⏳ Анализирую задачу... (10-15 сек)")
     
     try:
         photo_file = await update.message.photo[-1].get_file()
         photo_bytes = await photo_file.download_as_bytearray()
         image = Image.open(io.BytesIO(photo_bytes))
         
+        # Новый синтаксис для версии ≥0.8.0 (работает с .text)
         response = model.generate_content(
             [SYSTEM_PROMPT, image],
-            generation_config=genai.types.GenerationConfig(max_output_tokens=2048),
+            generation_config={"max_output_tokens": 2048},
             safety_settings={
                 "HARASSMENT": "BLOCK_NONE",
                 "HATE": "BLOCK_NONE",
@@ -80,11 +79,12 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             }
         )
         
-        if not response.candidates or not response.candidates[0].content.parts:
-            await update.message.reply_text("❌ Не удалось распознать задачу. Отправьте чёткое фото.")
+        # Автоматическая обработка блокировок безопасности
+        if hasattr(response, 'prompt_feedback') and response.prompt_feedback.block_reason:
+            await update.message.reply_text("❌ Запрос заблокирован системой безопасности. Отправьте другое фото.")
             return
         
-        solution = response.candidates[0].content.parts[0].text.strip()
+        solution = response.text.strip()
         
         if "ОШИБКА" in solution.upper()[:50]:
             await update.message.reply_text("❌ На фото не обнаружена учебная задача.")
@@ -124,14 +124,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         response = model.generate_content(
             [followup_prompt, context_data['image']],
-            generation_config=genai.types.GenerationConfig(max_output_tokens=1024)
+            generation_config={"max_output_tokens": 1024}
         )
         
-        if not response.candidates or not response.candidates[0].content.parts:
-            await update.message.reply_text("❌ Не понял вопрос. Повторите иначе.")
+        if hasattr(response, 'prompt_feedback') and response.prompt_feedback.block_reason:
+            await update.message.reply_text("❌ Вопрос заблокирован. Попробуйте сформулировать иначе.")
             return
             
-        answer = response.candidates[0].content.parts[0].text.strip()
+        answer = response.text.strip()
         await update.message.reply_text(answer)
         
     except Exception as e:
@@ -144,7 +144,7 @@ def main():
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     
-    logger.info("🚀 Бот запущен! Версии: PTB=21.0.1, Gemini=0.7.2 (модель: gemini-1.0-pro-vision-latest)")
+    logger.info("🚀 Бот запущен! Версии: PTB=21.0.1, Gemini≥0.8.3 (модель: gemini-1.5-flash)")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
