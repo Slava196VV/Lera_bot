@@ -15,28 +15,29 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Получаем переменные окружения
+# Переменные окружения
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 HF_TOKEN = os.getenv('HF_TOKEN')
 
-# Проверка обязательных переменных
 if not TELEGRAM_TOKEN:
-    logger.error("❌ Переменная TELEGRAM_BOT_TOKEN не установлена!")
+    logger.error("❌ TELEGRAM_BOT_TOKEN не установлен!")
     exit(1)
 if not HF_TOKEN:
-    logger.error("❌ Переменная HF_TOKEN не установлена!")
+    logger.error("❌ HF_TOKEN не установлен!")
     exit(1)
 
-# Конфигурация Hugging Face
-API_URL = "https://api-inference.huggingface.co/models/Qwen/Qwen2-VL-7B-Instruct"
-HEADERS = {"Authorization": f"Bearer {HF_TOKEN}"}
+# НОВЫЙ Hugging Face Inference Router (2026)
+HF_ROUTER_URL = "https://router.huggingface.co/v1/inference"
+HEADERS = {
+    "Authorization": f"Bearer {HF_TOKEN}",
+    "Content-Type": "application/json"
+}
 
 # Системный промпт
 SYSTEM_PROMPT = """Ты опытный школьный репетитор для учеников 11 класса. 
 Реши задачу по шагам с подробными объяснениями. Выдели финальный ответ словом "Ответ:".
 Пиши на русском языке. Если на фото нет учебной задачи — ответь только "ОШИБКА"."""
 
-# Хранилище контекста (для уточняющих вопросов)
 user_contexts = {}
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -54,15 +55,14 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text("⏳ Анализирую задачу... (30–60 секунд)")
 
     try:
-        # Получаем фото в максимальном разрешении
+        # Получаем фото
         photo_file = await update.message.photo[-1].get_file()
         photo_bytes = await photo_file.download_as_bytearray()
-
-        # Конвертируем в base64
         base64_image = base64.b64encode(photo_bytes).decode('utf-8')
 
-        # Формируем запрос
+        # НОВЫЙ ФОРМАТ ЗАПРОСА ДЛЯ router.huggingface.co
         payload = {
+            "model": "Qwen/Qwen2-VL-7B-Instruct",
             "inputs": {
                 "image": base64_image,
                 "text": SYSTEM_PROMPT + "\n\nРеши задачу на изображении."
@@ -73,24 +73,26 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             }
         }
 
-        # Отправляем запрос с повторными попытками (важно для Railway)
+        # Отправляем запрос с повторными попытками
         for attempt in range(3):
             try:
                 response = requests.post(
-                    API_URL,
+                    HF_ROUTER_URL,
                     headers=HEADERS,
                     json=payload,
-                    timeout=60  # Railway может убить процесс дольше 55 сек
+                    timeout=60
                 )
+                
                 if response.status_code == 200:
                     break
                 elif response.status_code == 503 and "estimated_time" in response.text:
-                    # Модель загружается — ждём
                     await msg.edit_text("🔄 Модель запускается... Подождите ещё 30 секунд")
                     await asyncio.sleep(30)
                     continue
                 else:
-                    raise Exception(f"HTTP {response.status_code}: {response.text[:200]}")
+                    error_detail = response.json().get("error", "Unknown error")
+                    raise Exception(f"HTTP {response.status_code}: {error_detail}")
+                    
             except requests.Timeout:
                 if attempt == 2:
                     raise
@@ -98,22 +100,16 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Обработка ответа
         result = response.json()
-        if isinstance(result, list) and len(result) > 0:
-            solution = result[0].get('generated_text', '').strip()
-        else:
-            solution = ""
+        solution = result.get("generated_text", "").strip()
 
         if not solution or "ОШИБКА" in solution.upper()[:50]:
             await msg.edit_text("❌ На фото не обнаружена учебная задача.\nПопробуйте чёткое фото из учебника.")
             return
 
-        # Сохраняем контекст
         user_contexts[user_id] = {'image_bytes': photo_bytes, 'solution': solution}
-
-        # Удаляем статусное сообщение
         await msg.delete()
 
-        # Отправляем решение
+        # Отправка решения
         if len(solution) > 4000:
             parts = [solution[i:i+4000] for i in range(0, len(solution), 4000)]
             for i, part in enumerate(parts, 1):
@@ -129,7 +125,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "❌ Не удалось решить задачу.\n"
             "Возможные причины:\n"
             "• Фото слишком размытое\n"
-            "• Задача написана от руки неразборчиво\n"
             "• Сервер Hugging Face перегружен\n\n"
             "Попробуйте отправить фото ещё раз через 1–2 минуты."
         )
@@ -155,6 +150,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 Ответь кратко и по делу на русском языке."""
 
         payload = {
+            "model": "Qwen/Qwen2-VL-7B-Instruct",
             "inputs": {
                 "image": base64_image,
                 "text": followup_prompt
@@ -162,9 +158,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "parameters": {"max_new_tokens": 1024}
         }
 
-        response = requests.post(API_URL, headers=HEADERS, json=payload, timeout=40)
+        response = requests.post(HF_ROUTER_URL, headers=HEADERS, json=payload, timeout=40)
+        
+        if response.status_code != 200:
+            raise Exception(f"HTTP {response.status_code}")
+            
         result = response.json()
-        answer = result[0].get('generated_text', '').strip() if isinstance(result, list) else ""
+        answer = result.get("generated_text", "").strip()
 
         await msg.delete()
         if answer:
@@ -182,7 +182,7 @@ def main():
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    logger.info("🚀 Бот запущен! Модель: Qwen2-VL-7B (Hugging Face)")
+    logger.info("🚀 Бот запущен! Модель: Qwen2-VL-7B (Hugging Face Router)")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
