@@ -19,7 +19,7 @@ GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
 
 # Инициализация Gemini
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel('gemini-2.0-flash-exp')
+model = genai.GenerativeModel('gemini-1.5-flash')
 
 # Системный промпт для решения задач
 SYSTEM_PROMPT = """Ты опытный школьный репетитор для учеников 11 класса. 
