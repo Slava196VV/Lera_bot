@@ -7,7 +7,6 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 from PIL import Image
 import io
 
-# Настройка логирования
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
@@ -16,14 +15,16 @@ logger = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
-GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+
+# ИСПОЛЬЗУЕМ ДОСТУПНУЮ МОДЕЛЬ ИЗ ВАШЕГО СПИСКА
+GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1/models/gemini-2.0-flash-001:generateContent?key={GEMINI_API_KEY}"
 
 if not TELEGRAM_TOKEN or not GEMINI_API_KEY:
     logger.error("❌ Не установлены переменные окружения")
     exit(1)
 
 SYSTEM_PROMPT = """Ты опытный школьный репетитор для учеников 11 класса. 
-Реши задачу по шагам, объясни каждое действие, выдели финальный ответ словом "Ответ:".
+Реши задачу по шагам с подробными объяснениями. Выдели финальный ответ словом "Ответ:".
 Пиши на русском языке. Если на фото нет задачи — ответь "ОШИБКА"."""
 
 user_contexts = {}
@@ -33,16 +34,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    await update.message.reply_text("⏳ Анализирую задачу... (10-15 сек)")
+    await update.message.reply_text("⏳ Анализирую задачу... (8-15 сек)")
     
     try:
+        # Получаем фото
         photo_file = await update.message.photo[-1].get_file()
         photo_bytes = await photo_file.download_as_bytearray()
-        
-        # Конвертация в base64
         base64_image = base64.b64encode(photo_bytes).decode('utf-8')
         
-        # Формирование запроса к v1 API
+        # Формируем запрос к gemini-2.0-flash-001
         payload = {
             "contents": [{
                 "parts": [
@@ -67,19 +67,16 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ]
         }
         
-        # Прямой запрос к API v1
+        # Отправляем запрос
         response = requests.post(GEMINI_API_URL, json=payload, timeout=30)
         
         if response.status_code != 200:
-            logger.error(f"Gemini API error {response.status_code}: {response.text}")
+            error_detail = response.json().get('error', {}).get('message', 'Unknown error')
+            logger.error(f"Gemini API error {response.status_code}: {error_detail}")
             await update.message.reply_text("❌ Ошибка ИИ. Попробуйте позже.")
             return
         
         data = response.json()
-        if 'candidates' not in data or not data['candidates']:
-            await update.message.reply_text("❌ Не удалось распознать задачу.")
-            return
-        
         solution = data['candidates'][0]['content']['parts'][0]['text'].strip()
         
         if "ОШИБКА" in solution.upper()[:50]:
@@ -88,6 +85,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         user_contexts[user_id] = {'image_bytes': photo_bytes, 'solution': solution}
         
+        # Отправляем решение
         if len(solution) > 4000:
             for i in range(0, len(solution), 4000):
                 await update.message.reply_text(solution[i:i+4000])
@@ -153,7 +151,7 @@ def main():
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     
-    logger.info("🚀 Бот запущен! Используется прямой запрос к Gemini v1 API")
+    logger.info("🚀 Бот запущен! Модель: gemini-2.0-flash-001")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
